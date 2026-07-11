@@ -52,6 +52,12 @@ def read_csv(file) -> pd.DataFrame:
     return pd.read_csv(file)
 
 
+def preview_text(df: pd.DataFrame, n: int = 20) -> str:
+    if df is None or df.empty:
+        return "<empty>"
+    return df.head(n).to_csv(index=False)
+
+
 def infer_columns(df: pd.DataFrame):
     cols = list(df.columns)
     amp_exact = "Amplicon_No" if "Amplicon_No" in cols else None
@@ -277,21 +283,29 @@ def style_sheet(writer, engine_name, sheet_name, df):
 def parse_ivv(description: str):
     if description is None or (isinstance(description, float) and np.isnan(description)):
         return "NON-MATCH", np.nan, "", "0", 0.0, False
+
     s = str(description).strip()
-    m0 = re.match(r"^\s*([A-Za-z])(\d+)\b", s)
+    if not s:
+        return "NON-MATCH", np.nan, "", "0", 0.0, False
+
+    parts = [p.strip() for p in s.split("-")]
+    if len(parts) < 3:
+        return "NON-MATCH", np.nan, "", "0", 0.0, False
+
+    first = parts[0]
+    last = parts[-1].strip() or "0"
+    middle = "-".join(parts[1:-1]).strip()
+    dose_val = numeric_from_string(last)
+    if middle == "" or pd.isna(dose_val):
+        return "NON-MATCH", np.nan, "", "0", 0.0, False
+
+    m0 = re.match(r"^([A-Za-z])(\d+)$", first)
     if not m0:
         return "NON-MATCH", np.nan, "", "0", 0.0, False
-    grp_letter = m0.group(1)
+
+    grp = m0.group(1).upper()
     rep_num = float(m0.group(2))
-    parts = s.split("-")
-    if len(parts) == 1:
-        return grp_letter, rep_num, "", "0", 0.0, True
-    last = parts[-1]
-    middle = "-".join(parts[1:-1]) if len(parts) > 2 else ""
-    grna = middle.strip()
-    dose_str = last.strip() or "0"
-    dose_val = numeric_from_string(dose_str)
-    return grp_letter, rep_num, grna, dose_str, dose_val, True
+    return grp, rep_num, middle, last, dose_val, True
 
 
 def parse_invitro(description: str):
@@ -326,6 +340,75 @@ def add_derived_export_metrics(df, hdr_indel_col, ref_indel_col, hdr_sub_col, am
     return out
 
 
+def render_heatmap_block(fdf_plot, primary_col, safe_mode):
+    st.subheader("HDR%_with_substitutions heatmap")
+    if safe_mode:
+        st.info("Safe mode is on: heatmap is disabled.")
+        return
+    if primary_col not in fdf_plot.columns:
+        st.info("Metric column not found.")
+        return
+
+    row_labels = list("ABCDEFGH")
+    col_labels = [str(i) for i in range(1, 13)]
+    row_index = {r: i for i, r in enumerate(row_labels)}
+    col_index = {c: i for i, c in enumerate(col_labels)}
+
+    def _well_to_rc(w):
+        m = re.match(r"^\s*([A-Ha-h])\s*[-:]?\s*(\d{1,2})\s*$", str(w))
+        if not m:
+            return None
+        return row_index[m.group(1).upper()], col_index[str(int(m.group(2)))]
+
+    df_heat = fdf_plot[["_Plate", "_Well", primary_col]].copy()
+    df_heat["_rc"] = df_heat["_Well"].map(_well_to_rc)
+    df_heat = df_heat[df_heat["_rc"].notna()].copy()
+    if df_heat.empty:
+        st.caption("No valid wells.")
+        return
+
+    plates_for_heat = sorted(df_heat["_Plate"].dropna().unique().tolist())
+    col_slots = st.columns(2)
+    for i, plate in enumerate(plates_for_heat):
+        sub = df_heat[df_heat["_Plate"] == plate].copy().drop_duplicates("_rc", keep="first")
+        Z = np.full((8, 12), np.nan, dtype=float)
+        text_matrix = np.empty((8, 12), dtype=object)
+        text_matrix[:] = ""
+        for _, r in sub.iterrows():
+            rr, cc = r["_rc"]
+            val = r[primary_col]
+            if pd.notna(val):
+                v = round(float(val))
+                Z[rr, cc] = v
+                text_matrix[rr, cc] = str(int(v))
+        fig_hm = go.Figure(data=go.Heatmap(
+            z=Z,
+            x=col_labels,
+            y=row_labels,
+            colorscale="Viridis",
+            zmin=0,
+            zmax=100,
+            colorbar=dict(title="HDR%", thickness=10, outlinewidth=0),
+            text=text_matrix,
+            texttemplate="%{text}",
+            textfont=dict(color="black"),
+            hovertemplate="Row %{y}, Col %{x}<br>Val: %{z:.0f}<extra></extra>",
+        ))
+        fig_hm.update_yaxes(autorange="reversed", tickfont=dict(color="black"))
+        fig_hm.update_xaxes(side="top", tickfont=dict(color="black"))
+        fig_hm.update_layout(
+            title=dict(text=str(plate), x=0.9, xanchor="center", y=0.95, font=dict(color="black", size=20)),
+            margin=dict(l=10, r=10, t=40, b=10),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            height=360,
+        )
+        with col_slots[i % 2]:
+            st.plotly_chart(fig_hm, width="stretch", config={"displaylogo": False})
+        if (i % 2) == 1 and (i + 1) < len(plates_for_heat):
+            col_slots = st.columns(2)
+
+
 with st.sidebar:
     st.header("1) Load data")
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -357,6 +440,7 @@ else:
     _input_name = "input.csv"
 _file_stem = os.path.splitext(os.path.basename(_input_name))[0]
 excel_filename = f"{_file_stem}_PE_GraphPad_Input.xlsx"
+allow_dataframe_preview = False
 
 with st.expander("Detected columns / change if needed", expanded=False):
     c1, c2 = st.columns(2)
@@ -402,10 +486,20 @@ if in_vivo_mode:
     df["_Dose"] = list(dstr)
     df["_DoseVal"] = list(dval)
     df["_InVivoMatch"] = list(ok)
+
+    excluded_non_vivo_df = df.loc[~df["_InVivoMatch"]].copy()
     df = df[df["_InVivoMatch"]].copy()
     if df.empty:
-        st.warning("In vivo mode is enabled, but none of the rows match A1-<gRNA>-<dose>.")
+        st.warning("In vivo mode is enabled, but none of the rows start with a treatment-group letter plus mouse number, such as A1-<gRNA>-<dose>.")
         st.stop()
+
+    if len(excluded_non_vivo_df) > 0:
+        st.warning(
+            f"In vivo mode kept {len(df)} matching row(s) and excluded {len(excluded_non_vivo_df)} non-matching row(s). "
+            f"Only descriptions that start with a letter+mouse number, such as A1-... or B2-..., are treated as in vivo."
+        )
+        with st.expander(f"Show rows excluded by in vivo parsing ({len(excluded_non_vivo_df)})", expanded=False):
+            st.code(preview_text(excluded_non_vivo_df), language="text")
 else:
     grp, dstr, dval = zip(*df[desc_col].map(parse_invitro))
     df["_Group"] = list(grp)
@@ -437,33 +531,12 @@ if apply_qc:
     st.success(f"QC trimming kept {kept}/{total_pre_qc} rows ({removed} removed).")
     with st.expander(f"Show filtered-out samples ({removed})", expanded=False):
         if removed > 0:
-            st.dataframe(removed_df, use_container_width=True, hide_index=True)
+            st.code(preview_text(removed_df), language="text")
 else:
     st.info("QC trimming is disabled.")
 
 st.subheader("QC: Sequencing depth & alignment")
-if rin_col and raa_col:
-    df["_ReadsIn_pos"] = np.where(df[rin_col] > 0, df[rin_col], np.nan)
-    safe_max = np.nanmax(df["_ReadsIn_pos"]) if np.isfinite(np.nanmax(df["_ReadsIn_pos"])) else 1.0
-    ticks = []
-    t = 1.0
-    while t <= max(1.0, safe_max * 1.2):
-        ticks.append(t)
-        t *= 10.0
-    qc1, qc2 = st.columns(2)
-    with qc1:
-        fig1 = px.strip(df.assign(_X="All"), x="_X", y="_ReadsIn_pos", hover_data={sid_col: True, desc_col: True, rin_col: True})
-        fig1.update_yaxes(type="log", tickvals=ticks, ticktext=[str(int(v)) if v >= 1 else str(v) for v in ticks])
-        fig1.update_layout(xaxis_title="", yaxis_title="Reads_in_input (log scale)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig1, use_container_width=True)
-    with qc2:
-        fig2 = px.strip(df.assign(_X="All"), x="_X", y="alignment%", hover_data={sid_col: True, desc_col: True, rin_col: True, raa_col: True})
-        fig2.update_layout(xaxis_title="", yaxis_title="alignment% (all samples)", showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig2, use_container_width=True)
-else:
-    st.warning("QC plots require Reads columns.")
-
-st.markdown("---")
+st.info("Use the Troubleshooting panel at the bottom of the sidebar only if the app becomes unstable.")
 
 
 def _on_plates_change():
@@ -570,6 +643,13 @@ with st.sidebar:
     png_w = st.number_input("PNG width (px)", min_value=800, max_value=2400, value=1200, step=50)
     png_h = int(round(png_w * 9 / 16)) if lock_ratio else st.number_input("PNG height", value=675)
     png_scale = st.slider("Scale (sharpness)", 1, 3, 2)
+    st.header("5) Troubleshooting")
+    with st.expander("Troubleshooting", expanded=False):
+        safe_mode = st.checkbox(
+            "Safe mode (disable Plotly charts)",
+            value=False,
+            help="Use this only if the app becomes unstable. It disables Plotly chart rendering and Excel export but keeps parsing available.",
+        )
 
 if not selected_plates:
     st.info("Select at least one plate to continue.")
@@ -584,7 +664,7 @@ if amp_col and selected_amplicons:
 fdf = df[mask].copy()
 fdf_plot = fdf.copy()
 all_metric_cols = [m["col"] for m in active_pe_metrics]
-clip_nonnegative_inplace(fdf_plot, all_metric_cols + [rin_col, raa_col, "alignment%"])
+clip_nonnegative_inplace(fdf_plot, all_metric_cols + [rin_col, raa_col, "alignment%"]) 
 fdf_plot = add_derived_export_metrics(fdf_plot, col_hdr_indel, col_ref_indel, col_hdr_sub, col_ambig)
 fdf = add_derived_export_metrics(fdf, col_hdr_indel, col_ref_indel, col_hdr_sub, col_ambig)
 
@@ -639,46 +719,70 @@ present = set(desc_vals)
 x_categories = [x for x in x_categories if x in present] or list(dict.fromkeys(desc_vals))
 agg_indel["_DescLabel"] = pd.Categorical(agg_indel["_DescLabel"], categories=x_categories, ordered=True)
 
-palette_cycle = [px.colors.sequential.Blues, px.colors.sequential.Mint, px.colors.sequential.Oranges, px.colors.sequential.Purples, px.colors.sequential.Greens, px.colors.sequential.Reds, px.colors.sequential.Greys]
+group_shade_sets = [
+    ["#7f0000", "#b30000", "#d7301f", "#ef6548", "#fc8d59", "#fdbb84"],
+    ["#8c2d04", "#cc4c02", "#ec7014", "#fe9929", "#fec44f", "#fee391"],
+    ["#08306b", "#08519c", "#2171b5", "#4292c6", "#6baed6", "#9ecae1"],
+    ["#00441b", "#006d2c", "#238b45", "#41ab5d", "#74c476", "#a1d99b"],
+    ["#3f007d", "#54278f", "#6a51a3", "#807dba", "#9e9ac8", "#bcbddc"],
+    ["#004d4d", "#006d6f", "#008b8b", "#1aa3a3", "#66c2c2", "#99d8d8"],
+    ["#000000", "#252525", "#525252", "#737373", "#969696", "#bdbdbd"],
+]
 
 
-def darkest_to_lightest(pal, n):
-    half = pal[max(0, len(pal) // 2):]
-    seq = list(reversed(half))
-    if n <= 1:
-        return [seq[0]]
-    idxs = [int(i * (len(seq) - 1) / (n - 1)) for i in range(n)]
-    return [seq[i] for i in idxs]
+def shade_map_for_doses(rank_order, palette):
+    if not rank_order:
+        return {}
+    max_idx = len(palette) - 1
+    return {dose: palette[min(i, max_idx)] for i, dose in enumerate(rank_order)}
+
+
+def style_filled_bar_chart(fig):
+    fig.update_traces(width=0.9, marker_line_width=0, opacity=1.0)
+    fig.update_layout(bargap=0.12, bargroupgap=0.0)
+    return fig
 
 
 color_discrete_map = {}
 if in_vivo_mode:
     for gi, g in enumerate(pd.unique(agg_indel["_Group"].astype(str))):
-        pal = palette_cycle[gi % len(palette_cycle)]
+        palette = group_shade_sets[gi % len(group_shade_sets)]
         sub = agg_indel[agg_indel["_Group"] == g]
         subu = sub.drop_duplicates(subset="_Dose").copy()
-        rank_order = subu.sort_values("_DoseVal", ascending=False)["_Dose"].astype(str).tolist() if subu["_DoseVal"].notna().any() else list(dict.fromkeys(sub["_Dose"].astype(str)))
-        shades = darkest_to_lightest(pal, max(len(rank_order), 1))
-        dose2shade = dict(zip(rank_order, shades))
+        if subu["_DoseVal"].notna().any():
+            rank_order = subu.sort_values(["_DoseVal", "_Dose"], ascending=[False, True])["_Dose"].astype(str).tolist()
+        else:
+            rank_order = list(dict.fromkeys(sub["_Dose"].astype(str)))
+        dose2shade = shade_map_for_doses(rank_order, palette)
+        darkest = palette[0]
         for _, row in sub.iterrows():
             lbl = f"{row['_Group']}-{row['_gRNA']}-{row['_Dose']}"
-            color_discrete_map[lbl] = dose2shade.get(str(row["_Dose"]), shades[0])
+            color_discrete_map[lbl] = dose2shade.get(str(row["_Dose"]), darkest)
 else:
     for gi, (g, sub) in enumerate(agg_indel.groupby("_Group")):
-        pal = palette_cycle[gi % len(palette_cycle)]
+        palette = group_shade_sets[gi % len(group_shade_sets)]
         subu = sub.drop_duplicates(subset="_Dose").copy()
-        rank_order = subu.sort_values("_DoseVal", ascending=False)["_Dose"].astype(str).tolist() if subu["_DoseVal"].notna().any() else [d for d in dose_high_to_low if d in set(subu["_Dose"].astype(str))]
-        shades = darkest_to_lightest(pal, max(len(rank_order), 1))
-        for d, c in zip(rank_order, shades):
-            color_discrete_map[f"{g}-{d}"] = c
+        if subu["_DoseVal"].notna().any():
+            rank_order = subu.sort_values(["_DoseVal", "_Dose"], ascending=[False, True])["_Dose"].astype(str).tolist()
+        else:
+            rank_order = [d for d in dose_high_to_low if d in set(subu["_Dose"].astype(str))]
+            if not rank_order:
+                rank_order = list(dict.fromkeys(subu["_Dose"].astype(str)))
+        dose2shade = shade_map_for_doses(rank_order, palette)
+        darkest = palette[0]
+        for d in subu["_Dose"].astype(str).tolist():
+            color_discrete_map[f"{g}-{d}"] = dose2shade.get(str(d), darkest)
 
 if agg_indel.empty:
     st.warning("No data to plot.")
+elif safe_mode:
+    st.info("Safe mode is on: primary Plotly bar chart is disabled.")
 else:
     fig = px.bar(agg_indel.sort_values("_DescLabel"), x="_DescLabel", y="mean", error_y="std", color="_DescLabel", color_discrete_map=color_discrete_map, hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean": ":.2f", "std": ":.2f", "count": True})
+    style_filled_bar_chart(fig)
     fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), xaxis_title=None, yaxis_title="Mean HDR%_with_substitutions (± SD)", showlegend=False, yaxis=dict(range=[0, 100], tickfont=dict(color="black"), title=dict(font=dict(color="black"))), xaxis=dict(tickfont=dict(color="black"), title=dict(font=dict(color="black"))), plot_bgcolor="white", paper_bgcolor="white")
-    config = {"toImageButtonOptions": {"format": "png", "filename": "hdr_sub_bars", "width": int(png_w), "height": int(png_h), "scale": int(png_scale)}, "displaylogo": False}
-    st.plotly_chart(fig, use_container_width=True, config=config)
+    config = {"toImageButtonOptions": {"format": "png", "filename": "hdr_sub_bars", "width": 1200, "height": 675, "scale": 2}, "displaylogo": False}
+    st.plotly_chart(fig, width="stretch", config=config)
 
 if show_oof and secondary_col and secondary_col in fdf_plot.columns:
     if in_vivo_mode:
@@ -689,10 +793,14 @@ if show_oof and secondary_col and secondary_col in fdf_plot.columns:
         agg_oof["_DescLabel"] = agg_oof["_Group"].astype(str) + "-" + agg_oof["_Dose"].astype(str)
     agg_oof["_DescLabel"] = pd.Categorical(agg_oof["_DescLabel"], categories=x_categories, ordered=True)
     if not agg_oof.empty:
-        fig2 = px.bar(agg_oof.sort_values("_DescLabel"), x="_DescLabel", y="mean", error_y="std", color="_DescLabel", color_discrete_map=color_discrete_map, hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean": ":.2f", "std": ":.2f", "count": True})
-        fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), xaxis_title=None, yaxis_title="Mean HDR_with_indel% (± SD)", showlegend=False, yaxis=dict(range=[0, 100], tickfont=dict(color="black"), title=dict(font=dict(color="black"))), xaxis=dict(tickfont=dict(color="black")), plot_bgcolor="white", paper_bgcolor="white")
-        config2 = {"toImageButtonOptions": {"format": "png", "filename": "hdr_indel_bars", "width": int(png_w), "height": int(png_h), "scale": int(png_scale)}, "displaylogo": False}
-        st.plotly_chart(fig2, use_container_width=True, config=config2)
+        if safe_mode:
+            st.info("Safe mode is on: secondary Plotly bar chart is disabled.")
+        else:
+            fig2 = px.bar(agg_oof.sort_values("_DescLabel"), x="_DescLabel", y="mean", error_y="std", color="_DescLabel", color_discrete_map=color_discrete_map, hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean": ":.2f", "std": ":.2f", "count": True})
+            style_filled_bar_chart(fig2)
+            fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), xaxis_title=None, yaxis_title="Mean HDR_with_indel% (± SD)", showlegend=False, yaxis=dict(range=[0, 100], tickfont=dict(color="black"), title=dict(font=dict(color="black"))), xaxis=dict(tickfont=dict(color="black")), plot_bgcolor="white", paper_bgcolor="white")
+            config2 = {"toImageButtonOptions": {"format": "png", "filename": "hdr_indel_bars", "width": 1200, "height": 675, "scale": 2}, "displaylogo": False}
+            st.plotly_chart(fig2, width="stretch", config=config2)
 
 export_pe_metrics = []
 if col_hdr_sub is not None and col_hdr_sub in fdf_plot.columns:
@@ -801,16 +909,20 @@ if in_vivo_mode:
 
     gp_table = pd.DataFrame(nonpbs_rows + pbs_rows_sorted, columns=["gRNA"] + cols)
     st.subheader("Download")
-    excel_engine = "xlsxwriter" if HAS_XLSXWRITER else "openpyxl"
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine=excel_engine) as writer:
-        gp_table.to_excel(writer, index=False, sheet_name="group_gRNA_by_dose_reps")
-        rows_df.to_excel(writer, index=False, sheet_name="rows_used")
-        style_sheet(writer, excel_engine, "group_gRNA_by_dose_reps", gp_table)
-        style_sheet(writer, excel_engine, "rows_used", rows_df)
-    st.download_button("Download Excel (.xlsx) — In Vivo Table", data=buf.getvalue(), file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if safe_mode:
+        st.info("Safe mode is on: Excel export is disabled.")
+    else:
+        excel_engine = "xlsxwriter" if HAS_XLSXWRITER else "openpyxl"
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine=excel_engine) as writer:
+            gp_table.to_excel(writer, index=False, sheet_name="group_gRNA_by_dose_reps")
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")
+            style_sheet(writer, excel_engine, "group_gRNA_by_dose_reps", gp_table)
+            style_sheet(writer, excel_engine, "rows_used", rows_df)
+        st.download_button("Download Excel (.xlsx) — In Vivo Table", data=buf.getvalue(), file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    render_heatmap_block(fdf_plot, primary_col, safe_mode)
     st.subheader("gRNA table (In Vivo PE)")
-    st.dataframe(gp_table, use_container_width=True, hide_index=True)
+    st.code(preview_text(gp_table), language="text")
 else:
     groups_in_order = []
     for lbl in x_categories:
@@ -892,70 +1004,30 @@ else:
     type1_slim_df = type1_full_df[[c for c in type1_full_df.columns if not (str(c).endswith("_mean") or str(c).endswith("_SD"))]].copy()
 
     st.subheader("Download")
-    excel_engine = "xlsxwriter" if HAS_XLSXWRITER else "openpyxl"
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine=excel_engine) as writer:
-        if not type1_slim_df.empty:
-            type1_slim_df.to_excel(writer, index=False, sheet_name="type1_groups_slim")
-            style_sheet(writer, excel_engine, "type1_groups_slim", type1_slim_df)
-        if not type1_full_df.empty:
-            type1_full_df.to_excel(writer, index=False, sheet_name="type1_groups_full")
-            style_sheet(writer, excel_engine, "type1_groups_full", type1_full_df)
-        if not type2_df.empty:
-            type2_df.to_excel(writer, index=False, sheet_name="type2_doses")
-            style_sheet(writer, excel_engine, "type2_doses", type2_df)
-        rows_df.to_excel(writer, index=False, sheet_name="rows_used")
-        style_sheet(writer, excel_engine, "rows_used", rows_df)
-    st.download_button("Download Excel (.xlsx)", data=buf.getvalue(), file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if safe_mode:
+        st.info("Safe mode is on: Excel export is disabled.")
+    else:
+        excel_engine = "xlsxwriter" if HAS_XLSXWRITER else "openpyxl"
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine=excel_engine) as writer:
+            if not type1_slim_df.empty:
+                type1_slim_df.to_excel(writer, index=False, sheet_name="type1_groups_slim")
+                style_sheet(writer, excel_engine, "type1_groups_slim", type1_slim_df)
+            if not type1_full_df.empty:
+                type1_full_df.to_excel(writer, index=False, sheet_name="type1_groups_full")
+                style_sheet(writer, excel_engine, "type1_groups_full", type1_full_df)
+            if not type2_df.empty:
+                type2_df.to_excel(writer, index=False, sheet_name="type2_doses")
+                style_sheet(writer, excel_engine, "type2_doses", type2_df)
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")
+            style_sheet(writer, excel_engine, "rows_used", rows_df)
+        st.download_button("Download Excel (.xlsx)", data=buf.getvalue(), file_name=excel_filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    render_heatmap_block(fdf_plot, primary_col, safe_mode)
     st.subheader("In vitro tables (Preview)")
     which_gp = st.radio("Layout", options=["Type 1 slim (Rows=Group)", "Type 1 full (Rows=Group)", "Type 2 (Rows=Dose)"], index=0, horizontal=True)
     preview_df = type1_slim_df if which_gp.startswith("Type 1 slim") else type1_full_df if which_gp.startswith("Type 1 full") else type2_df
-    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+    st.code(preview_text(preview_df), language="text")
 
 st.subheader("Rows used")
-st.dataframe(rows_df, use_container_width=True, hide_index=True)
-
-st.subheader("HDR%_with_substitutions heatmap")
-if primary_col not in fdf_plot.columns:
-    st.info("Metric column not found.")
-else:
-    row_labels = list("ABCDEFGH")
-    col_labels = [str(i) for i in range(1, 13)]
-    row_index = {r: i for i, r in enumerate(row_labels)}
-    col_index = {c: i for i, c in enumerate(col_labels)}
-
-    def _well_to_rc(w):
-        m = re.match(r"^\s*([A-Ha-h])\s*[-:]?\s*(\d{1,2})\s*$", str(w))
-        if not m:
-            return None
-        return row_index[m.group(1).upper()], col_index[str(int(m.group(2)))]
-
-    df_heat = fdf_plot[["_Plate", "_Well", primary_col]].copy()
-    df_heat["_rc"] = df_heat["_Well"].map(_well_to_rc)
-    df_heat = df_heat[df_heat["_rc"].notna()].copy()
-    if df_heat.empty:
-        st.caption("No valid wells.")
-    else:
-        plates_for_heat = sorted(df_heat["_Plate"].dropna().unique().tolist())
-        col_slots = st.columns(2)
-        for i, plate in enumerate(plates_for_heat):
-            sub = df_heat[df_heat["_Plate"] == plate].copy().drop_duplicates("_rc", keep="first")
-            Z = np.full((8, 12), np.nan, dtype=float)
-            text_matrix = np.empty((8, 12), dtype=object)
-            text_matrix[:] = ""
-            for _, r in sub.iterrows():
-                rr, cc = r["_rc"]
-                val = r[primary_col]
-                if pd.notna(val):
-                    v = round(float(val))
-                    Z[rr, cc] = v
-                    text_matrix[rr, cc] = str(int(v))
-            fig_hm = go.Figure(data=go.Heatmap(z=Z, x=col_labels, y=row_labels, colorscale="Viridis", zmin=0, zmax=100, colorbar=dict(title="HDR%", thickness=10, outlinewidth=0), text=text_matrix, texttemplate="%{text}", textfont=dict(color="black"), hovertemplate="Row %{y}, Col %{x}<br>Val: %{z:.0f}<extra></extra>"))
-            fig_hm.update_yaxes(autorange="reversed", tickfont=dict(color="black"))
-            fig_hm.update_xaxes(side="top", tickfont=dict(color="black"))
-            fig_hm.update_layout(title=dict(text=str(plate), x=0.9, xanchor="center", y=0.95, font=dict(color="black", size=20)), margin=dict(l=10, r=10, t=40, b=10), plot_bgcolor="white", paper_bgcolor="white", height=360)
-            with col_slots[i % 2]:
-                st.plotly_chart(fig_hm, use_container_width=True, config={"displaylogo": False})
-            if (i % 2) == 1 and (i + 1) < len(plates_for_heat):
-                col_slots = st.columns(2)
+st.code(preview_text(rows_df), language="text")
